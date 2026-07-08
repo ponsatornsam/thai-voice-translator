@@ -1,14 +1,15 @@
 """
 Thai Voice Translator — WebSocket Handler
 ==========================================
-Module 2 + 3 + 4: WebSocket endpoint for receiving real-time audio chunks (PCM 16kHz mono)
+Module 2 + 3 + 4 + 5: WebSocket endpoint for receiving real-time audio chunks (PCM 16kHz mono)
 from the Android client over a persistent connection.
 
-Pipeline (current):
+Full Pipeline:
   Android ──binary PCM──► /ws/audio
-                            ├── whisper_service.transcribe_audio()  (Module 3)
+                            ├── whisper_service.transcribe_audio()   (Module 3)
                             ├── translate_service.translate_to_thai() (Module 4)
-                            └──► JSON ack + transcribed + translated text
+                            ├── tts_service.synthesize_speech()       (Module 5)
+                            └──► JSON status + binary audio (PCM) back to client
 """
 
 import logging
@@ -19,6 +20,9 @@ from whisper_service import transcribe_audio
 
 # Module 4: Translation to Thai
 from translate_service import translate_to_thai
+
+# Module 5: TTS via Piper
+from tts_service import synthesize_speech
 
 # Module logger
 logger = logging.getLogger("translator.websocket")
@@ -65,16 +69,28 @@ async def audio_stream(websocket: WebSocket):
             thai_text = await translate_to_thai(text) if text else ""
             logger.info(f"TH:  '{thai_text[:60]}{'...' if len(thai_text) > 60 else ''}'")
 
-            # ── Send result back to client ────────────────────────
-            ack = {
+            # ── Step 3: TTS (Module 5: Piper) ────────────────────
+            audio_out = synthesize_speech(thai_text) if thai_text else b""
+            logger.info(
+                f"TTS: {len(audio_out)} bytes "
+                f"({len(audio_out) / 32000:.1f}s)" if audio_out else "TTS: no audio"
+            )
+
+            # ── Send result to client ─────────────────────────────
+            # First, a JSON status message so the client knows what's coming
+            status = {
                 "type": "result",
                 "received_bytes": len(audio_bytes),
-                "text": text,           # Original transcribed text
-                "thai": thai_text,      # Thai translation
+                "text": text,                   # Original transcribed text
+                "thai": thai_text,               # Thai translation
+                "audio_bytes": len(audio_out),   # Size of audio to follow
             }
-            await websocket.send_json(ack)
+            await websocket.send_json(status)
 
-            logger.debug(f"Sent ack: {len(audio_bytes)} bytes")
+            # Then, send the synthesized audio as binary (if any)
+            if audio_out:
+                await websocket.send_bytes(audio_out)
+                logger.debug(f"Sent {len(audio_out)} bytes audio to client")
 
     except WebSocketDisconnect:
         logger.info(
