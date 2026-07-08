@@ -1,0 +1,31 @@
+# ============================================================
+# Thai Voice Translator — Backend Dependencies
+# Python 3.12+
+# ============================================================
+
+# Web framework & server
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+
+# ASR: Speech-to-Text (Faster-Whisper)
+faster-whisper>=1.0.3,<2.0.0
+ctranslate2>=4.4.0,<5.0.0
+
+# TTS: Text-to-Speech (Piper)
+piper-tts>=1.2.0
+
+# Audio processing
+ffmpeg-python>=0.2.0
+
+# Security: JWT authentication
+python-jose[cryptography]>=3.3.0,<4.0.0
+
+# WebSocket support
+websockets>=12.0,<14.0
+
+# HTTP client (for translation API calls)
+httpx>=0.27.0,<1.0.0
+
+# Audio format handling
+numpy>=1.26.0,<2.0.0
+soundfile>=0.12.0

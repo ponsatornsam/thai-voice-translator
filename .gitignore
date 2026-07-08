@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Models (ไฟล์ใหญ่ — เก็บแยกหรือ download ตอน deploy)
+models/*.onnx
+models/*.pt
+models/*.bin
+
+# Environment
+.env
+backend/.env
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Colab scratchpad
+*.ipynb

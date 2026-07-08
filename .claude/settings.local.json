@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(where git *)",
+      "Read(//c/Program Files/Git/bin/**)",
+      "Read(//c/Program Files \\(x86\\)/Git/bin/**)",
+      "Read(//c/Users/HP ALL IN ONE/AppData/Local/Programs/Git/bin/**)",
+      "Read(//c/Users/HP ALL IN ONE/scoop/shims/**)",
+      "Read(//c/Program Files/Git/cmd/**)",
+      "Bash(cmd.exe *)",
+      "Bash(claude mcp *)",
+      "Bash(where uv *)",
+      "Bash(git -C D:/AI_Thai remote -v)",
+      "Bash(git *)"
+    ]
+  }
+}
