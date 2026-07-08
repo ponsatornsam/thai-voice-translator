@@ -1,12 +1,14 @@
 """
 Thai Voice Translator — WebSocket Handler
 ==========================================
-Module 2 + 3: WebSocket endpoint for receiving real-time audio chunks (PCM 16kHz mono)
+Module 2 + 3 + 4: WebSocket endpoint for receiving real-time audio chunks (PCM 16kHz mono)
 from the Android client over a persistent connection.
 
 Pipeline (current):
-  Android ──binary PCM──► /ws/audio ──► whisper_service.transcribe_audio()
-                            ◄── JSON ack + transcribed text ────
+  Android ──binary PCM──► /ws/audio
+                            ├── whisper_service.transcribe_audio()  (Module 3)
+                            ├── translate_service.translate_to_thai() (Module 4)
+                            └──► JSON ack + transcribed + translated text
 """
 
 import logging
@@ -14,6 +16,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 # Module 3: ASR via Faster-Whisper
 from whisper_service import transcribe_audio
+
+# Module 4: Translation to Thai
+from translate_service import translate_to_thai
 
 # Module logger
 logger = logging.getLogger("translator.websocket")
@@ -52,15 +57,20 @@ async def audio_stream(websocket: WebSocket):
             # Store in buffer for future pipeline use
             audio_buffer.append(audio_bytes)
 
-            # ── Run ASR (Module 3: Faster-Whisper) ────────────────────
+            # ── Step 1: ASR (Module 3: Faster-Whisper) ──────────────
             text = transcribe_audio(audio_bytes)
-            logger.info(f"Transcribed: '{text[:60]}{'...' if len(text) > 60 else ''}'")
+            logger.info(f"ASR: '{text[:60]}{'...' if len(text) > 60 else ''}'")
 
-            # ── Send acknowledgement + transcription back to client ──
+            # ── Step 2: Translate to Thai (Module 4) ──────────────
+            thai_text = await translate_to_thai(text) if text else ""
+            logger.info(f"TH:  '{thai_text[:60]}{'...' if len(thai_text) > 60 else ''}'")
+
+            # ── Send result back to client ────────────────────────
             ack = {
-                "type": "ack",
+                "type": "result",
                 "received_bytes": len(audio_bytes),
-                "text": text,
+                "text": text,           # Original transcribed text
+                "thai": thai_text,      # Thai translation
             }
             await websocket.send_json(ack)
 

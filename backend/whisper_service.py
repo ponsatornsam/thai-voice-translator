@@ -19,7 +19,12 @@ logger = logging.getLogger("translator.whisper")
 
 # ── Singleton model instance ─────────────────────────────────────────
 # _model is None until first use; transcribe_audio() loads it on demand.
+# _model_load_failed is set to True if the model can't load — subsequent
+# calls skip the load attempt gracefully (prevents repeated crashes on
+# platforms where the native C++ library is incompatible, e.g. Windows
+# without proper C++ runtime for ctranslate2).
 _model = None
+_model_load_failed = False
 
 
 def _get_model():
@@ -27,30 +32,47 @@ def _get_model():
     Lazy-load the Faster-Whisper model (singleton).
 
     Returns:
-        WhisperModel: loaded model instance, ready for transcription.
+        WhisperModel or None: loaded model instance, or None if loading failed.
 
     Tries CUDA first (Colab T4 or local GPU), falls back to CPU.
     Model "base" is the smallest English+multilingual model (~142 MB)
     that still gives good accuracy for real-time use.
+
+    NOTE: On Windows without proper C++ runtime / Developer Mode, the
+    ctranslate2 native library may crash (segfault) when loading the model.
+    Set WHISPER_DISABLED=1 to skip model loading entirely for local dev.
+    In production (Docker/Linux/Colab), this is not an issue.
     """
-    global _model
+    global _model, _model_load_failed
+
     if _model is not None:
         return _model
+    if _model_load_failed:
+        return None
+
+    # Allow disabling ASR during development on incompatible platforms
+    import os
+    if os.environ.get("WHISPER_DISABLED", "").strip() in ("1", "true", "yes"):
+        logger.info("WHISPER_DISABLED=1 — skipping model load (dev mode)")
+        _model_load_failed = True
+        return None
 
     from faster_whisper import WhisperModel
 
     # ── Device selection ─────────────────────────────────────────────
-    # Check for CUDA availability (Colab GPU T4 during dev, or local GPU
-    # on the HP machine if it has one). Fall back to CPU otherwise.
     try:
-        import torch  # noqa: F401 — used by faster-whisper internally
-        # Try a tiny CUDA op to confirm GPU is actually usable
+        import torch  # noqa: F401
         _model = WhisperModel("base", device="cuda", compute_type="int8")
         logger.info("WhisperModel loaded on CUDA (GPU)")
     except Exception:
         logger.warning("CUDA not available, falling back to CPU")
-        _model = WhisperModel("base", device="cpu", compute_type="int8")
-        logger.info("WhisperModel loaded on CPU (int8)")
+        try:
+            _model = WhisperModel("base", device="cpu", compute_type="int8")
+            logger.info("WhisperModel loaded on CPU (int8)")
+        except Exception:
+            logger.exception("Failed to load WhisperModel — ASR disabled")
+            _model_load_failed = True
+            return None
 
     return _model
 
@@ -109,6 +131,9 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
         # ── Run Whisper transcription ─────────────────────────────────
         model = _get_model()
+        if model is None:
+            logger.warning("Whisper model not available — returning empty string")
+            return ""
         segments, info = model.transcribe(
             samples,
             beam_size=5,              # Beam search width
