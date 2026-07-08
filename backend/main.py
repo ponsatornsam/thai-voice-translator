@@ -10,8 +10,7 @@ Module 1: FastAPI application with health check, CORS, and WebSocket router plac
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# TODO (Module 2): Uncomment when websocket.py is created
-# from websocket import router as ws_router
+from websocket import router as ws_router
 
 # ── FastAPI App Instance ─────────────────────────────────────────────
 app = FastAPI(
@@ -41,8 +40,8 @@ async def health_check():
     return {"status": "ok"}
 
 
-# TODO (Module 2): Mount the WebSocket router once websocket.py exists.
-# app.include_router(ws_router)
+# Mount WebSocket router — /ws/audio for real-time audio streaming
+app.include_router(ws_router)
 
 
 # ── Entry Point ──────────────────────────────────────────────────────
