@@ -227,6 +227,7 @@ class TranslatorWebSocketClient {
         val url = buildUrl(serverUrl, apiKey)
         val request = Request.Builder()
             .url(url)
+            .header("ngrok-skip-browser-warning", "true")  // Bypass ngrok free-tier interstitial
             .build()
 
         Log.i(TAG, "Connecting to $serverUrl ...")
