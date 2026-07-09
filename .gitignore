@@ -26,5 +26,7 @@ backend/.env
 .DS_Store
 Thumbs.db
 
-# Colab scratchpad
+# Colab scratchpad (temporary notebooks)
 *.ipynb
+# Except: committed project notebooks
+!colab/*.ipynb
