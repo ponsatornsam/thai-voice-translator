@@ -30,3 +30,6 @@ Thumbs.db
 *.ipynb
 # Except: committed project notebooks
 !colab/*.ipynb
+# Android build outputs
+android/.gradle/
+android/app/build/

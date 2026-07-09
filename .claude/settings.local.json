@@ -44,7 +44,12 @@
       "Bash(WHISPER_DISABLED=1 python -m uvicorn main:app --host 0.0.0.0 --port 8000)",
       "Bash(pip list *)",
       "Bash(pip search *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(echo \"android/.gradle/\")",
+      "Bash(echo \"android/app/build/\")",
+      "Bash(echo \"android/gradle/\")",
+      "Bash(echo \"android/gradlew\")",
+      "Bash(echo \"android/gradlew.bat\")"
     ]
   }
 }

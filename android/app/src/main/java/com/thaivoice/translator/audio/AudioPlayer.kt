@@ -1,9 +1,12 @@
 package com.thaivoice.translator.audio
 
+import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -11,12 +14,27 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Plays raw PCM audio through the device speaker/headphones in real time.
+ * Plays raw PCM audio through the device speaker/headphones in real time,
+ * with **Audio Focus Ducking** — automatically reduces the volume of other
+ * apps (e.g. YouTube) while translated speech is playing.
  *
  * Designed to receive chunks from [TranslatorWebSocketClient.onAudioReceived][com.thaivoice.translator.network.TranslatorWebSocketClient]
  * and play them back with minimal latency — each chunk is written to the
  * [AudioTrack] as soon as the previous one finishes, creating a continuous
  * audio stream.
+ *
+ * # Audio Focus Ducking (v2 — Module 11)
+ *
+ * Before writing each chunk to [AudioTrack], we request transient audio focus
+ * with [AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK]. The Android audio
+ * system then:
+ * 1. Lowers the volume of any other app currently playing audio (e.g. YouTube)
+ * 2. Plays our translated speech at full volume
+ * 3. When we abandon focus (after the chunk finishes), YouTube returns to
+ *    its original volume automatically
+ *
+ * This is handled per-chunk (not per-session) so YouTube audio only ducks
+ * while translated speech is actively playing — natural conversation flow.
  *
  * # Audio Format (must match backend Piper TTS output)
  * - Sample rate:   **16,000 Hz**
@@ -38,7 +56,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * # Usage
  * ```kotlin
- * val player = AudioPlayer()
+ * val player = AudioPlayer(context)
  *
  * // Wire to WebSocket client
  * wsClient.onAudioReceived = { pcmBytes -> player.playChunk(pcmBytes) }
@@ -48,9 +66,10 @@ import java.util.concurrent.atomic.AtomicLong
  * ```
  *
  * @see android.media.AudioTrack
+ * @see android.media.AudioManager
  * @see com.thaivoice.translator.network.TranslatorWebSocketClient
  */
-class AudioPlayer {
+class AudioPlayer(context: Context) {
 
     // ── Audio Format Constants ─────────────────────────────────────────
     companion object {
@@ -67,6 +86,35 @@ class AudioPlayer {
 
         /** Bytes per sample: 2 (16-bit). */
         const val BYTES_PER_SAMPLE = 2
+    }
+
+    // ── Audio Focus (v2 Module 11: Ducking) ──────────────────────────
+    private val audioManager: AudioManager =
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private val hasAudioFocus = AtomicBoolean(false)
+
+    /** Focus listener — logs changes; ducking is handled automatically by OS. */
+    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                Log.d(TAG, "AudioFocus: GAIN — restored")
+                hasAudioFocus.set(true)
+            }
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                Log.w(TAG, "AudioFocus: LOSS — stopping")
+                hasAudioFocus.set(false)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                Log.d(TAG, "AudioFocus: LOSS_TRANSIENT")
+                hasAudioFocus.set(false)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                Log.v(TAG, "AudioFocus: LOSS_TRANSIENT_CAN_DUCK")
+                hasAudioFocus.set(false)
+            }
+        }
     }
 
     // ── AudioTrack ─────────────────────────────────────────────────────
@@ -187,6 +235,9 @@ class AudioPlayer {
                 "(${totalBytesWritten.get() / (SAMPLE_RATE * BYTES_PER_SAMPLE)}s PCM)"
         )
 
+        // Abandon any lingering audio focus
+        abandonAudioFocusAfterChunk()
+
         isRunning.set(false)
 
         // Cancel consumer coroutine
@@ -293,8 +344,19 @@ class AudioPlayer {
                     val chunk = chunkQueue.poll()
 
                     if (chunk != null && chunk.isNotEmpty()) {
+                        // ── Audio Focus Ducking (v2 Module 11) ──────────
+                        // Request transient focus with ducking before playing.
+                        // This tells the OS to lower YouTube's volume while
+                        // our translated speech plays.
+                        requestAudioFocusForChunk()
+
                         // Write to AudioTrack — blocks until buffer has room
                         val bytesWritten = track.write(chunk, 0, chunk.size)
+
+                        // ── Abandon focus after chunk wrote ─────────────
+                        // Give audio focus back so YouTube returns to normal volume.
+                        // Next chunk will request it again → natural ducking pattern.
+                        abandonAudioFocusAfterChunk()
 
                         if (bytesWritten > 0) {
                             totalBytesWritten.addAndGet(bytesWritten.toLong())
@@ -343,6 +405,69 @@ class AudioPlayer {
                 }
                 Log.i(TAG, "Playback stopped — total written: ${totalBytesWritten.get()} bytes")
             }
+        }
+    }
+
+    /**
+     * Request transient audio focus with ducking before playing a chunk.
+     *
+     * Uses [AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK] which tells the OS:
+     * "I'm about to play short speech audio — lower other apps' volume, but
+     * don't kill them entirely."
+     *
+     * Falls back gracefully on API < 26 (Oreo) by using the deprecated
+     * [AudioManager.requestAudioFocus] method.
+     */
+    private fun requestAudioFocusForChunk() {
+        if (hasAudioFocus.get()) return  // Already have focus
+
+        val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener(focusChangeListener)
+                .build()
+            audioManager.requestAudioFocus(audioFocusRequest!!)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                focusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            )
+        }
+
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            hasAudioFocus.set(true)
+            Log.v(TAG, "AudioFocus: GRANTED (ducking YouTube)")
+        } else {
+            Log.w(TAG, "AudioFocus: DENIED (result=$result)")
+        }
+    }
+
+    /**
+     * Abandon audio focus after the chunk finishes playing.
+     * This restores YouTube (or other apps) to their original volume.
+     *
+     * Idempotent — safe to call when focus is not held.
+     */
+    private fun abandonAudioFocusAfterChunk() {
+        if (!hasAudioFocus.getAndSet(false)) return  // Don't have focus
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.abandonAudioFocus(focusChangeListener)
+            }
+            Log.v(TAG, "AudioFocus: abandoned — YouTube volume restored")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error abandoning audio focus: ${e.message}")
         }
     }
 
