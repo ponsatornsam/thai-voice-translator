@@ -1,8 +1,9 @@
 """
 Thai Voice Translator — WebSocket Handler
 ==========================================
-Module 2–6: WebSocket endpoint for real-time audio streaming with
-full ASR → Translate → TTS pipeline and concurrent client support.
+Module 2–7: WebSocket endpoint for real-time audio streaming with
+full ASR → Translate → TTS pipeline, concurrent client support,
+and API key authentication.
 
 Architecture (Module 6):
   - CPU-bound tasks (Whisper ASR, Piper TTS) → run_in_executor
@@ -27,6 +28,9 @@ from translate_service import translate_to_thai
 
 # Module 5: TTS via Piper (CPU-bound)
 from tts_service import synthesize_speech
+
+# Module 7: Security — API key auth + rate limiting for WebSocket
+from security import require_api_key_ws
 
 logger = logging.getLogger("translator.websocket")
 router = APIRouter()
@@ -175,7 +179,17 @@ async def audio_stream(websocket: WebSocket):
 
     Multiple clients are handled concurrently by FastAPI's async WebSocket
     and run_in_executor for CPU-bound work — the event loop is never blocked.
+
+    Authentication (Module 7):
+      API key must be passed as a query parameter: /ws/audio?api_key=...
+      Invalid/missing key → connection closed with code 4001 before accept().
+      Rate limit exceeded → connection closed with code 4002 before accept().
     """
+    # ── Security check (Module 7) ───────────────────────────────────────
+    # Must be done BEFORE accept() — invalid clients are rejected immediately.
+    if not await require_api_key_ws(websocket):
+        return  # Connection already closed by security module
+
     await websocket.accept()
     client_ip = websocket.client.host if websocket.client else "unknown"
     logger.info(f"WebSocket client connected: {client_ip}")

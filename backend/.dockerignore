@@ -1,0 +1,56 @@
+# ============================================================================
+# .dockerignore — exclude from Docker build context
+# ============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Environment & Secrets ─────────────────────────────────────────────────
+.env
+*.env
+# Keep .env.example (it's safe — no real values)
+!.env.example
+
+# ── Git ───────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── IDE & Editor ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Test & Dev ────────────────────────────────────────────────────────────
+tests/
+test_*.py
+*_test.py
+.pytest_cache/
+
+# ── Docs ──────────────────────────────────────────────────────────────────
+docs/
+README*
+CLAUDE.md
+
+# ── Docker (avoid recursive copy) ─────────────────────────────────────────
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# ── Models (mounted as volume, NOT copied into image) ─────────────────────
+models/
+*.onnx
+*.json

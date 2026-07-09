@@ -1,0 +1,89 @@
+# ============================================================================
+# Thai Voice Translator — Docker Compose
+# ============================================================================
+# Module 8: Production deployment on the HP All-in-One home server.
+#
+# Usage:
+#   1. cp .env.example .env          # then edit .env with real values
+#   2. docker compose up --build -d  # build + start in background
+#   3. docker compose logs -f        # follow logs
+#   4. docker compose down           # stop and remove containers
+#
+# The server will be available at http://localhost:8000
+# Health check: http://localhost:8000/health
+# ============================================================================
+
+version: "3.9"
+
+services:
+  # ── Main Backend Service ──────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: thai-voice-translator:latest
+    container_name: thai-translator-backend
+
+    ports:
+      - "8000:8000"
+
+    # ── Volumes ─────────────────────────────────────────────────────────
+    # Models directory — place Piper .onnx + .json voice model files here.
+    # Host path (left) is relative to this docker-compose.yml file location.
+    # Example: download th_TH model into ./models/
+    volumes:
+      - ./models:/app/models:ro          # :ro = read-only for safety
+
+    # ── Environment ─────────────────────────────────────────────────────
+    # Load secrets from .env file (NEVER commit .env to git).
+    # .env.example is provided as a template with all required variables.
+    env_file:
+      - .env
+
+    # ── Restart Policy ──────────────────────────────────────────────────
+    # unless-stopped: restarts on crash or host reboot.
+    # Container keeps running until you explicitly run `docker compose down`.
+    restart: unless-stopped
+
+    # ── Health Check ────────────────────────────────────────────────────
+    # Docker will monitor the container and restart on unhealthy status.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    # ── Resource Limits (optional — adjust for your hardware) ───────────
+    # Whisper + Piper need significant memory (~1-2 GB recommended).
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 4g
+    #     reservations:
+    #       memory: 1g
+
+    # ── Logging ─────────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+# ============================================================================
+# Future: cloudflared tunnel service (Module 13)
+# ============================================================================
+# To expose this server to the internet via Cloudflare Tunnel, add:
+#
+#   cloudflared:
+#     image: cloudflare/cloudflared:latest
+#     container_name: thai-translator-tunnel
+#     command: tunnel --config /etc/cloudflared/config.yml run
+#     volumes:
+#       - ./cloudflared:/etc/cloudflared:ro
+#     restart: unless-stopped
+#     depends_on:
+#       - backend
+#     network_mode: host
+#
+# See docs/deployment.md (Module 13) for full instructions.

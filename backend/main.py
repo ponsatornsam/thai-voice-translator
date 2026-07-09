@@ -7,10 +7,11 @@ Real-time speech-to-speech translation pipeline:
 Module 1: FastAPI application with health check, CORS, and WebSocket router placeholder.
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from websocket import router as ws_router
+from security import require_api_key, get_rate_limit_stats  # Module 7
 
 # ── FastAPI App Instance ─────────────────────────────────────────────
 app = FastAPI(
@@ -36,11 +37,37 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """Health-check endpoint for monitoring and Docker health checks."""
+    """Health-check endpoint for monitoring and Docker health checks.
+
+    This endpoint is intentionally OPEN (no auth) so Docker and monitoring
+    tools can check server status without needing an API key.
+    """
     return {"status": "ok"}
 
 
+@app.get("/admin/rate-limits")
+async def rate_limit_diagnostics(
+    ip: str | None = None,
+    _=Depends(require_api_key),  # Protected: requires valid API key
+):
+    """
+    Diagnostic endpoint — view current rate-limit status.
+
+    Query params:
+        ip (optional): Check a specific IP address.
+
+    Requires valid API key via X-API-Key header or ?api_key= query param.
+    """
+    import security
+    return {
+        "auth_enabled": bool(security.BACKEND_API_KEY),
+        "stats": security.get_rate_limit_stats(ip),
+    }
+
+
 # Mount WebSocket router — /ws/audio for real-time audio streaming
+# WebSocket connections are authenticated via query parameter (?api_key=...)
+# before accept() — see websocket.py and security.py (Module 7).
 app.include_router(ws_router)
 
 
@@ -65,7 +92,7 @@ if __name__ == "__main__":
 # whisper_service.py ← Module 3 — Faster-Whisper ASR (speech → text)
 # translate_service.py ← Module 4 — Translation API (text → Thai text)
 # tts_service.py     ← Module 5 — Piper TTS (Thai text → audio PCM)
-# security.py        ← Module 7 — API key auth + rate limiting
+# security.py        ← Module 7 — API key auth + rate limiting ✅
 #
 # Module 6  — Pipeline orchestration + async concurrency
 # Module 8  — Dockerfile + docker-compose.yml
