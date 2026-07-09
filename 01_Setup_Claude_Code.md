@@ -138,12 +138,12 @@ claude mcp add firebase -- npx -y firebase-tools@latest mcp
 
 ## Checklist ก่อนเริ่ม Module 0 (เหมือนเดิมแต่ปรับสำหรับ Claude Code)
 
-* \[ ] `claude` เปิดและ login สำเร็จ
-* \[ ] อยู่ในโฟลเดอร์ project ที่ clone จาก GitHub แล้ว (`cd` เข้าถูกที่)
-* \[ ] มีไฟล์ `CLAUDE.md` ที่สรุป tech stack + กติกาของโปรเจกต์แล้ว
-* \[ ] เพิ่ม Colab MCP ด้วย `claude mcp add` เรียบร้อย
-* \[ ] เปิด Colab notebook ตั้ง Runtime เป็น T4 GPU ค้างไว้
-* \[ ] สั่งเชื่อมต่อ Colab MCP ในเซสชันสำเร็จ เห็น GPU จริงผ่าน `nvidia-smi`
+* [x] `claude` เปิดและ login สำเร็จ ✅ (2026-07-08)
+* [x] อยู่ในโฟลเดอร์ project ที่ clone จาก GitHub แล้ว (`cd` เข้าถูกที่) ✅ `D:\AI_Thai`
+* [x] มีไฟล์ `CLAUDE.md` ที่สรุป tech stack + กติกาของโปรเจกต์แล้ว ✅
+* [x] เพิ่ม Colab MCP ด้วย `claude mcp add` เรียบร้อย ✅ (ใช้กับ Module 3, 5)
+* [ ] เปิด Colab notebook ตั้ง Runtime เป็น T4 GPU ค้างไว้ — เฉพาะตอนทำ Module ที่มี 🟢
+* [ ] สั่งเชื่อมต่อ Colab MCP ในเซสชันสำเร็จ เห็น GPU จริงผ่าน `nvidia-smi` — เฉพาะตอนทำ Module ที่มี 🟢
 
 \---
 

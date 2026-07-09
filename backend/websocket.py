@@ -160,6 +160,91 @@ async def run_pipeline(audio_bytes: bytes) -> dict:
     return result
 
 
+# ============================================================================
+# Module 12: Latency Optimization — Pipeline Overlap Strategies
+# ============================================================================
+#
+# ## Current Latency Breakdown (sequential pipeline, ~1s chunk)
+#
+#   Step         Typical (CPU)    Typical (GPU T4)    Bound
+#   ─────────    ─────────────    ────────────────    ──────
+#   ASR           0.8–2.0 s         0.2–0.5 s        CPU
+#   Translate     0.3–1.0 s         0.3–1.0 s        Network (API)
+#   TTS           0.2–0.8 s         0.2–0.5 s        CPU
+#   ─────────────────────────────────────────────────
+#   TOTAL         1.3–3.8 s         0.7–2.0 s
+#
+# Target: < 2.0s end-to-end latency for natural conversation feel.
+#
+# ## Strategy A: Inter-Chunk Pipelining (recommended — implement first)
+#
+# Process chunk N+1's ASR while chunk N's Translate+TTS run:
+#
+#   Chunk 0: [ASR]  →  [Translate]  →  [TTS]
+#   Chunk 1:           [ASR]  →  [Translate]  →  [TTS]
+#   Chunk 2:                      [ASR]  →  [Translate]  →  [TTS]
+#
+# Because ASR is CPU-bound (executor thread) and Translate is I/O-bound
+# (async await), they naturally overlap when launched as separate tasks.
+#
+# Expected improvement: ~30–40% latency reduction (ASR hidden behind Translate+TTS).
+#
+# TODO(Module 12): Implement inter-chunk pipelining
+#   1. Replace the sequential await in audio_stream() with asyncio.create_task():
+#      - Start pipeline_task(chunk_0) as a background task
+#      - Immediately receive chunk_1, start pipeline_task(chunk_1)
+#      - Use asyncio.gather() or a task queue to collect results
+#   2. Be careful: ASR+TTS both use run_in_executor (default thread pool).
+#      With multiple concurrent chunks, the thread pool may saturate.
+#      Increase ThreadPoolExecutor max_workers or use dedicated pools.
+#   3. Track chunk ordering — results may complete out-of-order.
+#      Send audio back with a sequence number so the client can reorder.
+#
+# ## Strategy B: Streaming ASR (partial transcripts)
+#
+# Faster-Whisper returns segments via a generator. We can start translating
+# the first segment while later segments are still being transcribed:
+#
+#   ASR: [seg1] [seg2] [seg3]
+#   TL:         [seg1] [seg2] [seg3]
+#   TTS:               [seg1] [seg2] [seg3]
+#
+# This requires modifying whisper_service.py to yield segments instead of
+# joining them into a single string.
+#
+# TODO(Module 12): Streaming ASR in whisper_service.py
+#   1. Add transcribe_audio_streaming(audio_bytes) -> AsyncGenerator[str, None]
+#   2. Modify run_pipeline() to iterate segments and start TL/TTS earlier
+#   3. Merge TTS output for all segments before sending to client
+#
+# ## Strategy C: Dedicated Thread Pools
+#
+# Currently both ASR and TTS share the default ThreadPoolExecutor.
+# On multi-core machines (HP All-in-One probably has 4–8 cores), dedicated
+# pools allow ASR and TTS to run truly in parallel on different cores.
+#
+# TODO(Module 12): Dedicated executor pools
+#   1. Create separate ThreadPoolExecutor instances:
+#      - asr_executor (max_workers=2) for Whisper
+#      - tts_executor (max_workers=2) for Piper
+#   2. Update _run_cpu_bound() to accept an optional executor parameter
+#   3. This prevents TTS from queuing behind ASR when multiple clients connect
+#
+# ## Strategy D: Model Quantization + Compute Type
+#
+# Current config: Faster-Whisper "base" model, int8 quantisation.
+#   - "tiny" model: 2× faster, ~5% worse accuracy (worth testing)
+#   - "int8_float16" compute_type: faster on some GPUs
+#   - Piper "low" quality model: smaller .onnx, faster inference
+#
+# TODO(Module 12): Experiment with model sizes
+#   1. Test "tiny" vs "base" Whisper on Colab GPU → accuracy vs speed trade-off
+#   2. Test Piper low vs medium quality → audio quality vs speed
+#   3. Make model size configurable via env var (WHISPER_MODEL_SIZE, PIPER_QUALITY)
+#
+# ============================================================================
+
+
 # ── WebSocket Endpoint ────────────────────────────────────────────────
 
 
