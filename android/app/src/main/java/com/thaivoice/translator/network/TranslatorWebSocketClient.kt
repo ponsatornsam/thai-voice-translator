@@ -6,6 +6,8 @@ import android.util.Log
 import okhttp3.*
 import okio.ByteString
 import org.json.JSONObject
+import java.io.IOException
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -58,6 +60,42 @@ import java.util.concurrent.atomic.AtomicInteger
  * @see com.thaivoice.translator.audio.AudioRecorder
  */
 class TranslatorWebSocketClient {
+
+    // ── Connection Status (public, for UI) ──────────────────────────────
+
+    /**
+     * Public-facing connection status for UI display.
+     * More granular than the internal [State] machine — includes health-check
+     * and auth-failure states the user needs to see.
+     */
+    enum class ConnectionStatus {
+        /** App started, no connection attempt yet. */
+        IDLE,
+        /** Running HTTP health check against /health endpoint. */
+        CHECKING_API,
+        /** Health check failed — server unreachable or network error. */
+        API_UNREACHABLE,
+        /** Health check passed, ready to connect. */
+        API_READY,
+        /** WebSocket handshake in progress. */
+        CONNECTING,
+        /** WebSocket open and ready for audio streaming. */
+        CONNECTED,
+        /** WebSocket closed (not auto-reconnecting). */
+        DISCONNECTED,
+        /** Auto-reconnect with exponential backoff. */
+        RECONNECTING,
+        /** 401/403 — wrong or missing API key. */
+        AUTH_FAILED
+    }
+
+    /** Result from [checkServerHealth]. */
+    data class HealthResult(
+        val reachable: Boolean,
+        val latencyMs: Long,
+        val httpCode: Int? = null,
+        val error: String? = null
+    )
 
     // ── Connection State ────────────────────────────────────────────────
 
@@ -125,6 +163,24 @@ class TranslatorWebSocketClient {
      */
     var onError: ((String) -> Unit)? = null
 
+    /**
+     * Rich connection-status callback — fires on every state transition.
+     *
+     * Provides a [ConnectionStatus] enum value plus a human-readable detail
+     * string (e.g. "Connected · latency 45ms" or "Reconnecting 3/5 · 4s backoff").
+     *
+     * Use this for detailed status indicators in the UI; [onConnectionStateChanged]
+     * is the simplified boolean version.
+     */
+    var onConnectionStatusChanged: ((ConnectionStatus, String) -> Unit)? = null
+
+    // ── Health Check ────────────────────────────────────────────────────
+
+    /** Single-thread executor for health-check HTTP calls. */
+    private val healthCheckExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "health-check").apply { isDaemon = true }
+    }
+
     // ── Public API ─────────────────────────────────────────────────────
 
     /**
@@ -157,6 +213,7 @@ class TranslatorWebSocketClient {
         pendingServerUrl = serverUrl
         pendingApiKey = apiKey
 
+        notifyStatus(ConnectionStatus.CONNECTING, "Connecting to server...")
         openConnection(serverUrl, apiKey)
     }
 
@@ -212,11 +269,59 @@ class TranslatorWebSocketClient {
         }
 
         state = State.DISCONNECTED
+        notifyStatus(ConnectionStatus.DISCONNECTED, "Disconnected by user")
         notifyConnectionState(false)
     }
 
     /** Returns `true` if the WebSocket is currently open and ready. */
     fun isConnected(): Boolean = state == State.CONNECTED
+
+    /**
+     * Check whether the backend server is reachable via HTTP GET /health.
+     *
+     * This is a quick pre-flight check before attempting a WebSocket connection.
+     * Run this first to give the user fast feedback on network/auth issues.
+     *
+     * Runs on a background thread; [callback] is invoked on that same thread —
+     * post to main thread yourself if updating UI.
+     *
+     * @param serverUrl Base URL, e.g. `"https://your-server.ngrok-free.dev"`.
+     * @param callback  Invoked with [HealthResult] when the check completes.
+     */
+    fun checkServerHealth(serverUrl: String, callback: (HealthResult) -> Unit) {
+        // Convert ws(s):// → http(s):// for health-check HTTP call
+        val httpUrl = serverUrl
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+        healthCheckExecutor.execute {
+            try {
+                val url = httpUrl.trimEnd('/') + "/health"
+                val client = OkHttpClient.Builder()
+                    .connectTimeout(5, TimeUnit.SECONDS)
+                    .readTimeout(5, TimeUnit.SECONDS)
+                    .build()
+                val request = Request.Builder()
+                    .url(url)
+                    .header("ngrok-skip-browser-warning", "true")
+                    .build()
+                val start = System.currentTimeMillis()
+                val response = client.newCall(request).execute()
+                val latency = System.currentTimeMillis() - start
+                val body = response.body?.string() ?: ""
+                val reachable = response.isSuccessful && body.contains("ok")
+                callback(HealthResult(reachable, latency, response.code))
+            } catch (e: IOException) {
+                callback(HealthResult(false, -1, error = e.message))
+            } catch (e: Exception) {
+                callback(HealthResult(false, -1, error = e.message))
+            }
+        }
+    }
+
+    /** Shutdown the health-check thread pool. Call when the client is no longer needed. */
+    fun shutdown() {
+        healthCheckExecutor.shutdown()
+    }
 
     // ── Internal ───────────────────────────────────────────────────────
 
@@ -241,11 +346,15 @@ class TranslatorWebSocketClient {
                 Log.i(TAG, "WebSocket opened — connected to ${response.request.url}")
                 state = State.CONNECTED
                 reconnectAttempts.set(0)  // Reset backoff on success
+                notifyStatus(ConnectionStatus.CONNECTED, "Connected · ready for audio")
                 notifyConnectionState(true)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "WebSocket closed: code=$code reason=\"$reason\"")
+                // onClosed may be followed by handleDisconnect which sets RECONNECTING,
+                // so we only set DISCONNECTED here as a fallback — handleDisconnect
+                // will override if a reconnect is scheduled.
                 handleDisconnect()
             }
 
@@ -260,6 +369,7 @@ class TranslatorWebSocketClient {
                         Log.e(TAG, "Authentication failed — check BACKEND_API_KEY")
                         onError?.invoke("Authentication failed: ${t.message}")
                         state = State.DISCONNECTED
+                        notifyStatus(ConnectionStatus.AUTH_FAILED, "Auth failed — check API key")
                         notifyConnectionState(false)
                         return  // Skip reconnect
                     }
@@ -295,6 +405,7 @@ class TranslatorWebSocketClient {
         if (isDisconnecting.get()) {
             Log.d(TAG, "Client-initiated disconnect — not reconnecting")
             state = State.DISCONNECTED
+            notifyStatus(ConnectionStatus.DISCONNECTED, "Disconnected")
             notifyConnectionState(false)
             return
         }
@@ -304,6 +415,7 @@ class TranslatorWebSocketClient {
         if (attempts > maxReconnectAttempts) {
             Log.e(TAG, "Max reconnect attempts ($maxReconnectAttempts) reached — giving up")
             state = State.DISCONNECTED
+            notifyStatus(ConnectionStatus.DISCONNECTED, "Disconnected · max retries reached")
             notifyConnectionState(false)
             onError?.invoke("Connection lost — max reconnect attempts exceeded")
             return
@@ -316,6 +428,8 @@ class TranslatorWebSocketClient {
         Log.i(TAG, "Reconnect #$attempts in ${delayMs}ms (backoff: ${delayMs}ms)")
 
         state = State.RECONNECTING
+        val secs = delayMs / 1000
+        notifyStatus(ConnectionStatus.RECONNECTING, "Reconnecting $attempts/$maxReconnectAttempts · ${secs}s backoff")
 
         // Schedule reconnect on main thread looper
         val serverUrl = pendingServerUrl
@@ -324,6 +438,7 @@ class TranslatorWebSocketClient {
         if (serverUrl == null || apiKey == null) {
             Log.e(TAG, "No saved connection params — cannot reconnect")
             state = State.DISCONNECTED
+            notifyStatus(ConnectionStatus.DISCONNECTED, "Disconnected · no saved config")
             notifyConnectionState(false)
             return
         }
@@ -331,6 +446,7 @@ class TranslatorWebSocketClient {
         val runnable = Runnable {
             if (!isDisconnecting.get() && state == State.RECONNECTING) {
                 Log.d(TAG, "Attempting reconnect #$attempts...")
+                notifyStatus(ConnectionStatus.CONNECTING, "Connecting · retry $attempts/$maxReconnectAttempts")
                 openConnection(serverUrl, apiKey)
             }
         }
@@ -414,6 +530,15 @@ class TranslatorWebSocketClient {
             onConnectionStateChanged?.invoke(connected)
         } catch (e: Exception) {
             Log.w(TAG, "onConnectionStateChanged callback threw: ${e.message}")
+        }
+    }
+
+    private fun notifyStatus(status: ConnectionStatus, detail: String) {
+        Log.d(TAG, "Status: $status — $detail")
+        try {
+            onConnectionStatusChanged?.invoke(status, detail)
+        } catch (e: Exception) {
+            Log.w(TAG, "onConnectionStatusChanged callback threw: ${e.message}")
         }
     }
 

@@ -22,6 +22,14 @@ API_BASE = os.environ.get("TRANSLATE_API_BASE", "https://api.openai.com/v1")
 MODEL = os.environ.get("TRANSLATE_MODEL", "gpt-4o-mini")  # fast & cheap
 TIMEOUT_SEC = 5  # seconds — fail fast to keep total latency < 2s target
 
+# ── Fix Gemini endpoint ─────────────────────────────────────────────
+# Gemini OpenAI-compatible endpoint requires /openai/ in the path.
+# If the user set TRANSLATE_API_BASE to the base Gemini URL without /openai,
+# auto-insert it. Safe: OpenAI URLs already contain /v1 and won't match.
+if "generativelanguage.googleapis.com" in API_BASE and "/openai" not in API_BASE:
+    API_BASE = API_BASE.rstrip("/") + "/openai"
+    logger.info(f"Auto-corrected Gemini API base to: {API_BASE}")
+
 # ── Translation prompt ───────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a professional translator. "
@@ -93,7 +101,11 @@ async def translate_to_thai(text: str, source_lang: str = "auto") -> str:
         return text
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"Translation API HTTP {e.response.status_code}: {e.response.text[:200]}")
+        logger.error(
+            f"Translation API HTTP {e.response.status_code} — "
+            f"URL: {url}\n"
+            f"Response: {e.response.text[:500]}"
+        )
         return text
 
     except Exception:

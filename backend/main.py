@@ -71,6 +71,85 @@ async def rate_limit_diagnostics(
     }
 
 
+@app.get("/admin/pipeline-status")
+async def pipeline_status(
+    _=Depends(require_api_key),
+):
+    """
+    Diagnostic endpoint — check status of all pipeline services.
+
+    Returns the ready/not-ready state of each component:
+      - asr (Whisper model loaded?)
+      - translate (API key configured? API reachable?)
+      - tts (Piper or fallback available?)
+      - ffmpeg (for Google TTS fallback)
+
+    Requires valid API key.
+    """
+    status = {
+        "asr": {"ready": False, "detail": ""},
+        "translate": {"ready": False, "detail": ""},
+        "tts": {"ready": False, "detail": "", "method": "none"},
+        "ffmpeg": {"ready": False, "detail": ""},
+    }
+
+    # ── ASR check ────────────────────────────────────────────────────
+    if not os.environ.get("WHISPER_DISABLED", "").strip() in ("1", "true", "yes"):
+        try:
+            from whisper_service import preload_model as preload_whisper
+            import asyncio
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(None, preload_whisper)
+            if ok:
+                status["asr"]["ready"] = True
+                status["asr"]["detail"] = "Whisper model loaded"
+            else:
+                status["asr"]["detail"] = "Model not yet loaded (lazy init)"
+        except Exception as e:
+            status["asr"]["detail"] = f"Error: {e}"
+    else:
+        status["asr"]["ready"] = True  # Intentionally disabled
+        status["asr"]["detail"] = "WHISPER_DISABLED=1"
+
+    # ── Translation check ────────────────────────────────────────────
+    from translate_service import API_KEY as tk, API_BASE as tb, MODEL as tm
+    if tk and tk != "your-gemini-api-key-here":
+        status["translate"]["ready"] = True
+        status["translate"]["detail"] = f"Model: {tm} · Base: {tb}"
+    else:
+        status["translate"]["detail"] = "TRANSLATE_API_KEY not set or still placeholder"
+
+    # ── TTS check ────────────────────────────────────────────────────
+    from tts_service import check_model, _check_piper_binary, _check_ffmpeg
+    piper_model = check_model()
+    piper_bin = _check_piper_binary()
+    ffmpeg_ok = _check_ffmpeg()
+
+    status["ffmpeg"]["ready"] = ffmpeg_ok
+    status["ffmpeg"]["detail"] = "available" if ffmpeg_ok else "not found"
+
+    if piper_model and piper_bin:
+        status["tts"]["ready"] = True
+        status["tts"]["method"] = "piper"
+        status["tts"]["detail"] = "Piper TTS (high quality)"
+    elif ffmpeg_ok:
+        status["tts"]["ready"] = True
+        status["tts"]["method"] = "google_fallback"
+        status["tts"]["detail"] = "Google Translate TTS fallback (requires internet)"
+    else:
+        status["tts"]["detail"] = "No TTS available — install Piper or ffmpeg"
+
+    all_ready = all(
+        status[s]["ready"]
+        for s in ["asr", "translate", "tts"]
+    )
+
+    return {
+        "all_ready": all_ready,
+        "services": status,
+    }
+
+
 # Mount WebSocket router — /ws/audio for real-time audio streaming
 # WebSocket connections are authenticated via query parameter (?api_key=...)
 # before accept() — see websocket.py and security.py (Module 7).

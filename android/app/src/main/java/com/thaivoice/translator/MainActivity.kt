@@ -5,12 +5,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Color
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
+import android.view.Gravity
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -18,6 +21,7 @@ import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import com.thaivoice.translator.capture.AudioCaptureService
 import com.thaivoice.translator.network.TranslatorWebSocketClient
+import com.thaivoice.translator.network.Diagnostics
 import com.thaivoice.translator.audio.AudioPlayer
 
 /**
@@ -66,8 +70,14 @@ class MainActivity : ComponentActivity() {
     // ── UI Elements ────────────────────────────────────────────────────
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
-    private lateinit var statusText: TextView
+    private lateinit var diagButton: Button
+    private lateinit var statusDot: TextView         // Colored dot (●)
+    private lateinit var statusText: TextView         // Status description
+    private lateinit var latencyText: TextView        // "latency 45ms" or ""
     private lateinit var transcriptText: TextView
+    private lateinit var connectionCard: LinearLayout // Grouped status card
+    private lateinit var diagResultsContainer: LinearLayout // Diagnostics results
+    private var diagRunning = false                   // Prevent double-tap
 
     // ── Service Binding ────────────────────────────────────────────────
     private var captureService: AudioCaptureService? = null
@@ -94,8 +104,10 @@ class MainActivity : ComponentActivity() {
     }
 
     // ── WebSocket & Audio (managed by service internally, refs for wiring) ──
-    private val wsClient = TranslatorWebSocketClient()
-    private val audioPlayer = AudioPlayer(this)  // Context needed for AudioManager (ducking)
+    // Must use `by lazy` — AudioPlayer calls getSystemService() which requires
+    // the Activity to have passed through onCreate() first.
+    private val wsClient by lazy { TranslatorWebSocketClient() }
+    private val audioPlayer by lazy { AudioPlayer(this) }
 
     // ── MediaProjection Launcher ───────────────────────────────────────
     private lateinit var mediaProjectionLauncher: ActivityResultLauncher<Intent>
@@ -138,60 +150,115 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         audioPlayer.release()
         wsClient.disconnect()
+        wsClient.shutdown()
     }
 
     // ── UI Setup ───────────────────────────────────────────────────────
 
     private fun setupUI() {
-        // Create a simple vertical layout programmatically.
-        // In production, replace with res/layout/activity_main.xml
-        val linearLayout = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            setPadding(64, 128, 64, 64)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 96, 48, 48)
         }
 
         // Title
-        val titleView = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "Thai Voice Translator"
-            textSize = 24f
-            setPadding(0, 0, 0, 32)
-        }
-        linearLayout.addView(titleView)
+            textSize = 22f
+            setPadding(0, 0, 0, 24)
+        })
 
-        // Status indicator
+        // ── Connection Status Card ──────────────────────────────────────
+        connectionCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#F5F5F5"))
+            setPadding(20, 16, 20, 16)
+            // Rounded corners on API 31+ is set programmatically below
+        }
+        // Round the card corners
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            connectionCard.setBackgroundColor(Color.parseColor("#F5F5F5"))
+            // Simple background — clip not needed for solid color card
+        }
+
+        // Row: dot + status text
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        statusDot = TextView(this).apply {
+            text = "●"
+            textSize = 18f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 12, 0)
+        }
+
         statusText = TextView(this).apply {
-            text = "Status: Ready"
-            textSize = 16f
-            setPadding(0, 0, 0, 32)
+            text = "Not connected"
+            textSize = 15f
+            setTextColor(Color.DKGRAY)
         }
-        linearLayout.addView(statusText)
 
-        // Transcript preview
+        statusRow.addView(statusDot)
+        statusRow.addView(statusText)
+        connectionCard.addView(statusRow)
+
+        // Latency detail
+        latencyText = TextView(this).apply {
+            text = ""
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(30, 4, 0, 0)  // Indented under the dot+text
+        }
+        connectionCard.addView(latencyText)
+
+        root.addView(connectionCard)
+        root.addView(TextView(this).apply { setPadding(0, 0, 0, 12) }) // spacer
+
+        // ── Diagnostics Button ──────────────────────────────────────────
+        diagButton = Button(this).apply {
+            text = "Run Diagnostics"
+            isEnabled = true
+            setOnClickListener { runDiagnostics() }
+        }
+        root.addView(diagButton)
+
+        // ── Diagnostics Results ─────────────────────────────────────────
+        diagResultsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = android.view.View.GONE
+            setPadding(8, 8, 8, 8)
+        }
+        root.addView(diagResultsContainer)
+        root.addView(TextView(this).apply { setPadding(0, 0, 0, 16) }) // spacer
+
+        // ── Transcript preview ──────────────────────────────────────────
         transcriptText = TextView(this).apply {
             text = ""
             textSize = 14f
-            setPadding(0, 0, 0, 32)
+            setPadding(0, 0, 0, 24)
             minLines = 3
+            setTextColor(Color.DKGRAY)
         }
-        linearLayout.addView(transcriptText)
+        root.addView(transcriptText)
 
-        // Start button
+        // ── Buttons ─────────────────────────────────────────────────────
         startButton = Button(this).apply {
             text = "Start Translation"
-            isEnabled = true
+            isEnabled = false  // Disabled until API is ready
             setOnClickListener { requestMediaProjection() }
         }
-        linearLayout.addView(startButton)
+        root.addView(startButton)
 
-        // Stop button
         stopButton = Button(this).apply {
             text = "Stop Translation"
             isEnabled = false
             setOnClickListener { stopCapture() }
         }
-        linearLayout.addView(stopButton)
+        root.addView(stopButton)
 
-        setContentView(linearLayout)
+        setContentView(root)
     }
 
     // ── Notification Permission (Android 13+) ──────────────────────────
@@ -292,26 +359,79 @@ class MainActivity : ComponentActivity() {
     private fun wireServiceCallbacks() {
         val service = captureService ?: return
 
-        // 1. Connect WebSocket to backend
-        //    URL: use 10.0.2.2 for emulator, or your server's real IP/domain
-        val serverUrl = "ws://10.0.2.2:8000"  // TODO: make configurable
-        val apiKey = "dev-key"                // TODO: use BuildConfig.BACKEND_API_KEY
-        wsClient.connect(serverUrl, apiKey)
+        // ── 1. Health Check First ────────────────────────────────────────
+        val serverUrl = BuildConfig.BACKEND_SERVER_URL
+        val apiKey = BuildConfig.BACKEND_API_KEY
 
-        // 2. WebSocket connection status → UI
-        wsClient.onConnectionStateChanged = { connected ->
+        updateConnectionUI(TranslatorWebSocketClient.ConnectionStatus.CHECKING_API, "Checking API...", "")
+
+        wsClient.checkServerHealth(serverUrl) { result ->
             runOnUiThread {
-                statusText.text = if (connected) "Status: Connected" else "Status: Disconnected"
-                Log.d(TAG, "WebSocket ${if (connected) "connected" else "disconnected"}")
+                if (result.reachable) {
+                    val latencyInfo = "latency ${result.latencyMs}ms"
+                    updateConnectionUI(
+                        TranslatorWebSocketClient.ConnectionStatus.API_READY,
+                        "API ready",
+                        latencyInfo
+                    )
+                    Log.i(TAG, "Health check OK — ${result.latencyMs}ms, connecting WebSocket...")
+
+                    // Now connect WebSocket
+                    wsClient.connect(serverUrl, apiKey)
+                } else {
+                    val errMsg = result.error ?: "HTTP ${result.httpCode}"
+                    updateConnectionUI(
+                        TranslatorWebSocketClient.ConnectionStatus.API_UNREACHABLE,
+                        "API unreachable",
+                        errMsg
+                    )
+                    Log.e(TAG, "Health check FAILED: $errMsg")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Cannot reach server: $errMsg",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
 
-        // 3. Received Thai audio → AudioPlayer (with ducking)
+        // ── 2. Rich connection status → UI ──────────────────────────────
+        wsClient.onConnectionStatusChanged = { status, detail ->
+            runOnUiThread {
+                when (status) {
+                    TranslatorWebSocketClient.ConnectionStatus.CONNECTED -> {
+                        updateConnectionUI(status, detail, "") // latency already shown
+                        startButton.isEnabled = true
+                    }
+                    TranslatorWebSocketClient.ConnectionStatus.AUTH_FAILED -> {
+                        updateConnectionUI(status, detail, "")
+                        Toast.makeText(this, detail, Toast.LENGTH_LONG).show()
+                    }
+                    TranslatorWebSocketClient.ConnectionStatus.RECONNECTING -> {
+                        updateConnectionUI(status, detail, "")
+                    }
+                    TranslatorWebSocketClient.ConnectionStatus.DISCONNECTED -> {
+                        updateConnectionUI(status, detail, "")
+                        startButton.isEnabled = false
+                    }
+                    else -> {
+                        updateConnectionUI(status, detail, "")
+                    }
+                }
+            }
+        }
+
+        // Also keep simple boolean callback for backward compat
+        wsClient.onConnectionStateChanged = { connected ->
+            Log.d(TAG, "WebSocket ${if (connected) "connected" else "disconnected"}")
+        }
+
+        // ── 3. Received Thai audio → AudioPlayer (with ducking) ────────
         wsClient.onAudioReceived = { pcmBytes ->
             audioPlayer.playChunk(pcmBytes)
         }
 
-        // 4. Server errors → UI
+        // ── 4. Server errors → UI ───────────────────────────────────────
         wsClient.onError = { msg ->
             runOnUiThread {
                 Toast.makeText(this, "Error: $msg", Toast.LENGTH_SHORT).show()
@@ -319,12 +439,12 @@ class MainActivity : ComponentActivity() {
             Log.w(TAG, "Server error: $msg")
         }
 
-        // 5. Captured audio chunks → WebSocket
+        // ── 5. Captured audio chunks → WebSocket ─────────────────────────
         service.onAudioChunkReady = { chunk ->
             wsClient.sendAudioChunk(chunk)
         }
 
-        // 6. Capture errors → UI
+        // ── 6. Capture errors → UI ──────────────────────────────────────
         service.onCaptureError = { error ->
             runOnUiThread {
                 Toast.makeText(this, "Capture error: $error", Toast.LENGTH_LONG).show()
@@ -332,16 +452,164 @@ class MainActivity : ComponentActivity() {
             Log.e(TAG, "Capture error: $error")
         }
 
-        Log.i(TAG, "Full pipeline wired: Capture → WS → Backend → AudioPlayer")
+        Log.i(TAG, "Full pipeline wired: HealthCheck → WS → Backend → AudioPlayer")
     }
 
     // ── UI State ───────────────────────────────────────────────────────
+
+    /** Update the connection-status card (dot color + text + latency detail). */
+    private fun updateConnectionUI(
+        status: TranslatorWebSocketClient.ConnectionStatus,
+        message: String,
+        detail: String
+    ) {
+        val (color, dotColor) = when (status) {
+            TranslatorWebSocketClient.ConnectionStatus.IDLE -> "Not connected" to Color.GRAY
+            TranslatorWebSocketClient.ConnectionStatus.CHECKING_API -> "Checking..." to Color.parseColor("#FFA500") // orange
+            TranslatorWebSocketClient.ConnectionStatus.API_READY -> "API ready" to Color.parseColor("#4CAF50") // green
+            TranslatorWebSocketClient.ConnectionStatus.API_UNREACHABLE -> "Unreachable" to Color.RED
+            TranslatorWebSocketClient.ConnectionStatus.CONNECTING -> "Connecting..." to Color.parseColor("#FFA500")
+            TranslatorWebSocketClient.ConnectionStatus.CONNECTED -> "Connected" to Color.parseColor("#4CAF50")
+            TranslatorWebSocketClient.ConnectionStatus.DISCONNECTED -> "Disconnected" to Color.RED
+            TranslatorWebSocketClient.ConnectionStatus.RECONNECTING -> "Reconnecting..." to Color.parseColor("#FF9800")
+            TranslatorWebSocketClient.ConnectionStatus.AUTH_FAILED -> "Auth Failed" to Color.RED
+        }
+
+        statusDot.setTextColor(dotColor)
+        statusText.text = message
+        if (detail.isNotEmpty()) {
+            latencyText.text = detail
+            latencyText.visibility = TextView.VISIBLE
+        } else {
+            latencyText.visibility = TextView.GONE
+        }
+    }
 
     private fun updateUI(isCapturing: Boolean) {
         runOnUiThread {
             startButton.isEnabled = !isCapturing
             stopButton.isEnabled = isCapturing
-            statusText.text = if (isCapturing) "Status: Capturing..." else "Status: Ready"
+            if (isCapturing) {
+                statusText.text = "Capturing audio..."
+                statusDot.setTextColor(Color.parseColor("#4CAF50"))
+            }
         }
+    }
+
+    // ── Diagnostics ─────────────────────────────────────────────────────
+
+    /**
+     * Run the full pipeline diagnostic and display results step by step.
+     *
+     * Checks: Health → Auth → WebSocket → ASR → Translation → TTS
+     * Each result appears in real-time as it completes.
+     */
+    private fun runDiagnostics() {
+        if (diagRunning) {
+            Log.w(TAG, "Diagnostics already running — ignoring")
+            return
+        }
+        diagRunning = true
+        diagButton.isEnabled = false
+        diagButton.text = "Running Diagnostics..."
+        diagResultsContainer.removeAllViews()
+        diagResultsContainer.visibility = android.view.View.VISIBLE
+
+        val diag = Diagnostics()
+
+        diag.onProgress = { index, total, result ->
+            runOnUiThread { addDiagResult(result) }
+        }
+
+        val serverUrl = BuildConfig.BACKEND_SERVER_URL
+        val apiKey = BuildConfig.BACKEND_API_KEY
+
+        // Update connection card to show we're checking
+        updateConnectionUI(
+            TranslatorWebSocketClient.ConnectionStatus.CHECKING_API,
+            "Running diagnostics...",
+            ""
+        )
+
+        diag.runAll(serverUrl, apiKey) { allPassed, results ->
+            runOnUiThread {
+                diagRunning = false
+                diagButton.text = "Run Diagnostics"
+                diagButton.isEnabled = true
+
+                val passed = results.count { it.status == Diagnostics.CheckStatus.PASS }
+                val failed = results.count { it.status == Diagnostics.CheckStatus.FAIL }
+                val skipped = results.count { it.status == Diagnostics.CheckStatus.SKIPPED }
+
+                // Summary toast
+                val summary = buildString {
+                    append("✅ $passed passed")
+                    if (failed > 0) append(" · ❌ $failed failed")
+                    if (skipped > 0) append(" · ⏭️ $skipped skipped")
+                }
+                Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
+
+                // Update connection status based on results
+                if (allPassed) {
+                    updateConnectionUI(
+                        TranslatorWebSocketClient.ConnectionStatus.API_READY,
+                        "All checks passed",
+                        ""
+                    )
+                    // Auto-connect if everything is good
+                    wsClient.connect(serverUrl, apiKey)
+                } else {
+                    updateConnectionUI(
+                        TranslatorWebSocketClient.ConnectionStatus.API_UNREACHABLE,
+                        "$failed check(s) failed",
+                        "Tap 'Run Diagnostics' to retry"
+                    )
+                }
+            }
+        }
+    }
+
+    /** Add a single diagnostic check result row to the UI. */
+    private fun addDiagResult(result: Diagnostics.CheckResult) {
+        val rowColor = when (result.status) {
+            Diagnostics.CheckStatus.PASS -> Color.parseColor("#2E7D32")     // dark green
+            Diagnostics.CheckStatus.FAIL -> Color.parseColor("#C62828")     // dark red
+            Diagnostics.CheckStatus.SKIPPED -> Color.parseColor("#9E9E9E")  // grey
+            Diagnostics.CheckStatus.RUNNING -> Color.parseColor("#FF8F00")  // amber
+            Diagnostics.CheckStatus.PENDING -> Color.GRAY
+        }
+
+        val statusIcon = when (result.status) {
+            Diagnostics.CheckStatus.PASS -> "✅"
+            Diagnostics.CheckStatus.FAIL -> "❌"
+            Diagnostics.CheckStatus.SKIPPED -> "⏭️"
+            Diagnostics.CheckStatus.RUNNING -> "⏳"
+            Diagnostics.CheckStatus.PENDING -> "⬜"
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(4, 6, 4, 6)
+        }
+
+        // Icon + name
+        val label = TextView(this).apply {
+            text = "${result.emoji} ${result.name}"
+            textSize = 13f
+            setTextColor(rowColor)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        row.addView(label)
+
+        // Status + detail
+        val detail = TextView(this).apply {
+            text = "$statusIcon ${result.detail}"
+            textSize = 12f
+            setTextColor(rowColor)
+            gravity = Gravity.END
+        }
+        row.addView(detail)
+
+        diagResultsContainer.addView(row)
     }
 }
