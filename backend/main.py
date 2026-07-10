@@ -112,10 +112,11 @@ async def pipeline_status(
         status["asr"]["detail"] = "WHISPER_DISABLED=1"
 
     # ── Translation check ────────────────────────────────────────────
-    from translate_service import API_KEY as tk, API_BASE as tb, MODEL as tm
+    from translate_service import API_KEY as tk, API_BASE as tb, MODEL as tm, cache_stats
     if tk and tk != "your-gemini-api-key-here":
         status["translate"]["ready"] = True
         status["translate"]["detail"] = f"Model: {tm} · Base: {tb}"
+        status["translate"]["cache"] = cache_stats()
     else:
         status["translate"]["detail"] = "TRANSLATE_API_KEY not set or still placeholder"
 

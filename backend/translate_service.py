@@ -7,11 +7,16 @@ Module 4: Translates transcribed text into Thai using an external LLM API
 Design:
   - API key from TRANSLATE_API_KEY env var (never hardcoded)
   - 5-second timeout to keep pipeline latency low
+  - LRU cache for repeated words (avoids rate-limit waste on "Bye" x10)
+  - Exponential backoff + retry on 429 (rate limit)
   - Falls back to original text on any error (does NOT crash the pipeline)
 """
 
 import os
 import logging
+import asyncio
+from collections import OrderedDict
+
 import httpx
 
 logger = logging.getLogger("translator.translate")
@@ -19,13 +24,13 @@ logger = logging.getLogger("translator.translate")
 # ── Configuration from environment ───────────────────────────────────
 API_KEY = os.environ.get("TRANSLATE_API_KEY", "")
 API_BASE = os.environ.get("TRANSLATE_API_BASE", "https://api.openai.com/v1")
-MODEL = os.environ.get("TRANSLATE_MODEL", "gpt-4o-mini")  # fast & cheap
+MODEL = os.environ.get("TRANSLATE_MODEL", "gemini-1.5-flash")  # higher free tier RPM
 TIMEOUT_SEC = 5  # seconds — fail fast to keep total latency < 2s target
+CACHE_SIZE = int(os.environ.get("TRANSLATE_CACHE_SIZE", "50"))  # LRU cache entries
+MAX_RETRIES = int(os.environ.get("TRANSLATE_MAX_RETRIES", "2"))  # 429 retries
 
 # ── Fix Gemini endpoint ─────────────────────────────────────────────
 # Gemini OpenAI-compatible endpoint requires /openai/ in the path.
-# If the user set TRANSLATE_API_BASE to the base Gemini URL without /openai,
-# auto-insert it. Safe: OpenAI URLs already contain /v1 and won't match.
 if "generativelanguage.googleapis.com" in API_BASE and "/openai" not in API_BASE:
     API_BASE = API_BASE.rstrip("/") + "/openai"
     logger.info(f"Auto-corrected Gemini API base to: {API_BASE}")
@@ -39,16 +44,66 @@ SYSTEM_PROMPT = (
     "as if spoken by a native Thai speaker."
 )
 
+# ── LRU Translation Cache ────────────────────────────────────────────
+# Caches translations to avoid re-translating repeated words
+# (e.g., "Bye" appearing 10 times in a row = 1 API call instead of 10)
+_cache: OrderedDict[str, str] = OrderedDict()
+_cache_hits = 0
+_cache_misses = 0
+
+
+def _cache_key(text: str) -> str:
+    """Normalize text for cache lookup — lowercase, strip extra spaces."""
+    return text.strip().lower()
+
+
+def _cache_get(text: str) -> str | None:
+    """Return cached translation or None."""
+    global _cache_hits
+    key = _cache_key(text)
+    if key in _cache:
+        _cache.move_to_end(key)  # LRU: mark as recently used
+        _cache_hits += 1
+        return _cache[key]
+    _cache_misses += 1
+    return None
+
+
+def _cache_put(text: str, translation: str) -> None:
+    """Store translation in cache. Evicts oldest entry if full."""
+    key = _cache_key(text)
+    if key in _cache:
+        _cache.move_to_end(key)
+    else:
+        _cache[key] = translation
+        while len(_cache) > CACHE_SIZE:
+            _cache.popitem(last=False)  # Remove oldest (LRU)
+
+
+def cache_stats() -> dict:
+    """Return cache statistics for diagnostics."""
+    return {
+        "size": len(_cache),
+        "max": CACHE_SIZE,
+        "hits": _cache_hits,
+        "misses": _cache_misses,
+        "hit_rate": f"{_cache_hits / max(_cache_hits + _cache_misses, 1) * 100:.1f}%",
+    }
+
 
 # ── Public API ───────────────────────────────────────────────────────
+
+
 async def translate_to_thai(text: str, source_lang: str = "auto") -> str:
     """
     Translate text to Thai using an OpenAI-compatible API.
 
+    Uses LRU cache to avoid re-translating repeated text.
+    Retries on 429 (rate limit) with exponential backoff.
+
     Args:
         text: The source text to translate (any language).
         source_lang: Source language hint, or "auto" to let the model detect.
-                     Currently informational — the system prompt handles detection.
 
     Returns:
         Thai translation string. On any error, returns the original text
@@ -66,6 +121,12 @@ async def translate_to_thai(text: str, source_lang: str = "auto") -> str:
         )
         return text
 
+    # ── Cache lookup ─────────────────────────────────────────────────
+    cached = _cache_get(text)
+    if cached is not None:
+        logger.debug(f"Cache hit: '{text[:30]}' → '{cached[:30]}'")
+        return cached
+
     # ── Build request ────────────────────────────────────────────────
     url = f"{API_BASE.rstrip('/')}/chat/completions"
     headers = {
@@ -78,38 +139,79 @@ async def translate_to_thai(text: str, source_lang: str = "auto") -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.1,           # Low temp = consistent translations
-        "max_tokens": 512,            # More than enough for 1-2 sentences
+        "temperature": 0.1,
+        "max_tokens": 512,
     }
 
-    # ── Call API with timeout ────────────────────────────────────────
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SEC) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
+    # ── Call API with retry on 429 ───────────────────────────────────
+    last_error = None
 
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT_SEC) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code == 429:
+                # Rate limited — extract retry delay from response
+                retry_after = 15  # default
+                try:
+                    error_data = response.json()
+                    # Gemini returns retryDelay in the error details
+                    for detail in error_data.get("error", {}).get("details", []):
+                        if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+                            rd = detail.get("retryDelay", "15s")
+                            retry_after = int(rd.replace("s", ""))
+                except Exception:
+                    pass
+
+                logger.warning(
+                    f"Rate limited (429) — attempt {attempt + 1}/{MAX_RETRIES + 1}. "
+                    f"Retry after {retry_after}s"
+                )
+                last_error = "rate_limited"
+
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(retry_after)
+                    continue  # Retry
+                else:
+                    logger.error(
+                        f"Max retries ({MAX_RETRIES}) exhausted — returning original "
+                        f"to keep pipeline running"
+                    )
+                    return text
+
+            # Non-429 error or success
+            response.raise_for_status()
+            break  # Success — exit retry loop
+
+        except httpx.TimeoutException:
+            logger.warning(f"Translation API timeout after {TIMEOUT_SEC}s — returning original")
+            return text
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Translation API HTTP {e.response.status_code} — "
+                f"URL: {url}\nResponse: {e.response.text[:500]}"
+            )
+            return text
+
+        except Exception:
+            logger.exception("Translation API unexpected error — returning original")
+            return text
+
+    # ── Parse response ────────────────────────────────────────────────
+    try:
         data = response.json()
         translated = data["choices"][0]["message"]["content"].strip()
+        _cache_put(text, translated)  # Cache for future use
         logger.info(
             f"Translation: '{text[:50]}{'...' if len(text) > 50 else ''}' "
             f"→ '{translated[:80]}{'...' if len(translated) > 80 else ''}'"
         )
         return translated
 
-    except httpx.TimeoutException:
-        logger.warning(f"Translation API timeout after {TIMEOUT_SEC}s — returning original")
-        return text
-
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            f"Translation API HTTP {e.response.status_code} — "
-            f"URL: {url}\n"
-            f"Response: {e.response.text[:500]}"
-        )
-        return text
-
     except Exception:
-        logger.exception("Translation API unexpected error — returning original")
+        logger.exception("Failed to parse translation response — returning original")
         return text
 
 
@@ -119,24 +221,12 @@ def translate_to_thai_sync(text: str, source_lang: str = "auto") -> str:
     Synchronous wrapper around translate_to_thai().
     Use this with loop.run_in_executor() to avoid blocking the event loop
     when calling the translation API from an async context.
-
-    Args:
-        text: Source text to translate.
-        source_lang: Source language hint.
-
-    Returns:
-        Thai translation, or original text on error.
     """
     import asyncio
 
     try:
-        # Try to get the running event loop
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop — run async function directly
         return asyncio.run(translate_to_thai(text, source_lang))
 
-    # We're inside an event loop — but we're being called from run_in_executor,
-    # so we can safely create a new loop in this thread or just run synchronously.
-    # Actually, since httpx.AsyncClient needs an event loop, create one:
     return asyncio.run(translate_to_thai(text, source_lang))
